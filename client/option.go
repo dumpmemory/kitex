@@ -20,25 +20,29 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/cloudwego/kitex/internal/client"
-	internal_stats "github.com/cloudwego/kitex/internal/stats"
+	"github.com/cloudwego/kitex/pkg/circuitbreak"
 	"github.com/cloudwego/kitex/pkg/connpool"
 	"github.com/cloudwego/kitex/pkg/discovery"
 	"github.com/cloudwego/kitex/pkg/endpoint"
+	"github.com/cloudwego/kitex/pkg/fallback"
 	"github.com/cloudwego/kitex/pkg/http"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/loadbalance"
 	"github.com/cloudwego/kitex/pkg/loadbalance/lbcache"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/trans/netpollmux"
-	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2"
+	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/retry"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/pkg/utils"
+	"github.com/cloudwego/kitex/pkg/warmup"
+	"github.com/cloudwego/kitex/pkg/xds"
 	"github.com/cloudwego/kitex/transport"
 )
 
@@ -47,6 +51,18 @@ type Option = client.Option
 
 // Options is used to initialize a client.
 type Options = client.Options
+
+type UnaryOption = client.UnaryOption
+
+type UnaryOptions = client.UnaryOptions
+
+type StreamOption = client.StreamOption
+
+type StreamOptions = client.StreamOptions
+
+type TTHeaderStreamingOption = client.TTHeaderStreamingOption
+
+type TTHeaderStreamingOptions = client.TTHeaderStreamingOptions
 
 // A Suite is a collection of Options. It is useful to assemble multiple associated
 // Options as a single one to keep the order or presence in a desired manner.
@@ -61,16 +77,12 @@ func WithTransportProtocol(tp transport.Protocol) Option {
 		if tpName == transport.Unknown {
 			panic(fmt.Errorf("WithTransportProtocol: invalid '%v'", tp))
 		}
-		if tp == transport.GRPC {
-			o.RemoteOpt.ConnPool = nphttp2.NewConnPool()
-			o.RemoteOpt.CliHandlerFactory = nphttp2.NewCliTransHandlerFactory()
-		}
 		di.Push(fmt.Sprintf("WithTransportProtocol(%s)", tpName))
 		rpcinfo.AsMutableRPCConfig(o.Configs).SetTransportProtocol(tp)
 	}}
 }
 
-// WithSuite adds a option suite for client.
+// WithSuite adds an option suite for client.
 func WithSuite(suite Suite) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		var nested struct {
@@ -158,6 +170,9 @@ func WithHostPorts(hostports ...string) Option {
 				}, nil
 			},
 			NameFunc: func() string { return o.Targets },
+			TargetFunc: func(ctx context.Context, target rpcinfo.EndpointInfo) string {
+				return o.Targets
+			},
 		}
 	}}
 }
@@ -199,8 +214,6 @@ func WithLongConnection(cfg connpool.IdleConfig) Option {
 }
 
 // WithMuxConnection specifies the transport type to be mux.
-// IMPORTANT: this option is not stable, and will be changed or removed in the future!!!
-// We don't promise compatibility for this option in future versions!!!
 func WithMuxConnection(connNum int) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		di.Push("WithMuxConnection")
@@ -212,12 +225,9 @@ func WithMuxConnection(connNum int) Option {
 }
 
 // WithLogger sets the Logger for kitex client.
+// Deprecated: client uses the global klog.DefaultLogger.
 func WithLogger(logger klog.FormatLogger) Option {
-	return Option{F: func(o *client.Options, di *utils.Slice) {
-		di.Push(fmt.Sprintf("WithLogger(%T)", logger))
-
-		o.Logger = logger
-	}}
+	panic("client.WithLogger is deprecated")
 }
 
 // WithLoadBalancer sets the loadbalancer for client.
@@ -232,6 +242,9 @@ func WithLoadBalancer(lb loadbalance.Loadbalancer, opts ...*lbcache.Options) Opt
 }
 
 // WithRPCTimeout specifies the RPC timeout.
+//
+// Warning: WithRPCTimeout is only effective for unary methods.
+// It's recommended to use WithUnaryOptions(WithUnaryRPCTimeout(d)) instead.
 func WithRPCTimeout(d time.Duration) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		di.Push(fmt.Sprintf("WithRPCTimeout(%dms)", d.Milliseconds()))
@@ -251,6 +264,18 @@ func WithConnectTimeout(d time.Duration) Option {
 	}}
 }
 
+// WithTimeoutProvider adds a TimeoutProvider to the client.
+// Note that the timeout settings provided by the TimeoutProvider
+// will be applied before the other timeout options in this package
+// and those in the callopt package. Thus it can not modify the
+// timeouts set by WithRPCTimeout, WithUnaryRPCTimeout or WithConnectTimeout.
+func WithTimeoutProvider(p rpcinfo.TimeoutProvider) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithTimeoutProvider(%T(%+v))", p, p))
+		o.Timeouts = p
+	}}
+}
+
 // WithTag sets the customize tag for service discovery, eg: idc, cluster.
 func WithTag(key, val string) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
@@ -267,7 +292,7 @@ func WithTracer(c stats.Tracer) Option {
 		di.Push(fmt.Sprintf("WithTracer(%T{%+v})", c, c))
 
 		if o.TracerCtl == nil {
-			o.TracerCtl = &internal_stats.Controller{}
+			o.TracerCtl = &rpcinfo.TraceController{}
 		}
 		o.TracerCtl.Append(c)
 	}}
@@ -310,39 +335,254 @@ func WithConnReporterEnabled() Option {
 }
 
 // WithFailureRetry sets the failure retry policy for client.
+//
+// NOTICE: WithFailureRetry is only effective for all unary methods.
+// May provide WithUnaryOptions(WithUnaryFailureRetry(d)) option later which is more recommended.
 func WithFailureRetry(p *retry.FailurePolicy) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		if p == nil {
 			return
 		}
-		di.Push(fmt.Sprintf("WithFailureRetry(%+v)", *p))
-		if o.RetryPolicy == nil {
-			o.RetryPolicy = &retry.Policy{}
+		di.Push(fmt.Sprintf("WithFailureRetry(%+v)", p))
+		if o.UnaryOptions.RetryMethodPolicies == nil {
+			o.UnaryOptions.RetryMethodPolicies = make(map[string]retry.Policy)
 		}
-		if o.RetryPolicy.BackupPolicy != nil {
-			panic("BackupPolicy has been setup, cannot support Failure Retry at same time")
+		if o.UnaryOptions.RetryMethodPolicies[retry.Wildcard].MixedPolicy != nil ||
+			o.UnaryOptions.RetryMethodPolicies[retry.Wildcard].BackupPolicy != nil {
+			panic("MixedPolicy or BackupPolicy has been setup, cannot support Failure Retry at same time")
 		}
-		o.RetryPolicy.FailurePolicy = p
-		o.RetryPolicy.Enable = true
-		o.RetryPolicy.Type = retry.FailureType
+		o.UnaryOptions.RetryMethodPolicies[retry.Wildcard] = retry.BuildFailurePolicy(p)
 	}}
 }
 
 // WithBackupRequest sets the backup request policy for client.
+//
+// NOTICE: WithBackupRequest is only effective for all unary methods.
+// May provide WithUnaryOptions(WithUnaryBackupRequest(d)) option later which is more recommended.
 func WithBackupRequest(p *retry.BackupPolicy) Option {
 	return Option{F: func(o *client.Options, di *utils.Slice) {
 		if p == nil {
 			return
 		}
-		di.Push(fmt.Sprintf("WithBackupRequest(%+v)", *p))
-		if o.RetryPolicy == nil {
-			o.RetryPolicy = &retry.Policy{}
+		di.Push(fmt.Sprintf("WithBackupRequest(%+v)", p))
+		if o.UnaryOptions.RetryMethodPolicies == nil {
+			o.UnaryOptions.RetryMethodPolicies = make(map[string]retry.Policy)
 		}
-		if o.RetryPolicy.FailurePolicy != nil {
-			panic("Failure Retry has been setup, cannot support Backup Request at same time")
+		if o.UnaryOptions.RetryMethodPolicies[retry.Wildcard].MixedPolicy != nil ||
+			o.UnaryOptions.RetryMethodPolicies[retry.Wildcard].FailurePolicy != nil {
+			panic("MixedPolicy or BackupPolicy has been setup, cannot support Failure Retry at same time")
 		}
-		o.RetryPolicy.BackupPolicy = p
-		o.RetryPolicy.Enable = true
-		o.RetryPolicy.Type = retry.BackupType
+		o.UnaryOptions.RetryMethodPolicies[retry.Wildcard] = retry.BuildBackupRequest(p)
+	}}
+}
+
+// WithMixedRetry sets the mixed retry policy for client.
+//
+// NOTICE: WithMixedRetry is only effective for all unary methods.
+// May provide WithUnaryOptions(WithUnaryMixedRetry(d)) option later which is more recommended.
+func WithMixedRetry(p *retry.MixedPolicy) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if p == nil {
+			return
+		}
+		di.Push(fmt.Sprintf("WithMixedRetry(%+v)", p))
+		if o.UnaryOptions.RetryMethodPolicies == nil {
+			o.UnaryOptions.RetryMethodPolicies = make(map[string]retry.Policy)
+		}
+		// no need to check if BackupPolicy or FailurePolicy are been setup, just let mixed retry replace it
+		o.UnaryOptions.RetryMethodPolicies[retry.Wildcard] = retry.BuildMixedPolicy(p)
+	}}
+}
+
+// WithRetryMethodPolicies sets the retry policy for method.
+// The priority is higher than WithFailureRetry and WithBackupRequest. Only the methods which are not included by
+// this config will use the policy that is configured by WithFailureRetry or WithBackupRequest .
+// FailureRetry and BackupRequest can be set for different method at same time.
+// Notice: method name is case-sensitive, it should be same with the definition in IDL.
+//
+// NOTICE: WithRetryMethodPolicies is only effective for all unary methods.
+// May provide WithUnaryOptions(WithUnaryRetryMethodPolicies(d)) option later which is more recommended.
+func WithRetryMethodPolicies(mp map[string]retry.Policy) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if mp == nil {
+			return
+		}
+		di.Push(fmt.Sprintf("WithRetryMethodPolicies(%+v)", mp))
+		if o.UnaryOptions.RetryMethodPolicies == nil {
+			o.UnaryOptions.RetryMethodPolicies = make(map[string]retry.Policy)
+		}
+		wildcardCfg := o.UnaryOptions.RetryMethodPolicies[retry.Wildcard]
+		o.UnaryOptions.RetryMethodPolicies = mp
+		if wildcardCfg.Enable && !mp[retry.Wildcard].Enable {
+			// if there is enabled wildcard config before, keep it
+			o.UnaryOptions.RetryMethodPolicies[retry.Wildcard] = wildcardCfg
+		}
+	}}
+}
+
+// WithSpecifiedResultRetry is used with FailureRetry.
+// When you enable FailureRetry and want to retry with the specified error or response, you can configure this Option.
+// ShouldResultRetry is defined inside retry.FailurePolicy, so WithFailureRetry also can set ShouldResultRetry.
+// But if your retry policy is enabled by remote config, WithSpecifiedResultRetry is useful.
+//
+// NOTICE: WithSpecifiedResultRetry is only effective for all unary methods.
+// May provide WithUnaryOptions(WithUnarySpecifiedResultRetry(d)) option later which is more recommended.
+func WithSpecifiedResultRetry(rr *retry.ShouldResultRetry) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if rr == nil || !rr.IsValid() {
+			panic(fmt.Errorf("WithSpecifiedResultRetry: invalid '%+v'", rr))
+		}
+		di.Push(fmt.Sprintf("WithSpecifiedResultRetry(%+v)", rr))
+		o.UnaryOptions.RetryWithResult = rr
+	}}
+}
+
+// WithFallback is used to set the fallback policy for the client.
+// Demos are provided below:
+//
+//	demo1. fallback for error and resp
+//		`client.WithFallback(fallback.NewFallbackPolicy(yourFBFunc))`
+//	demo2. fallback for error and enable reportAsFallback, which sets reportAsFallback to be true and will do report(metric) as Fallback result
+//		`client.WithFallback(fallback.ErrorFallback(yourErrFBFunc).EnableReportAsFallback())`
+//	demo2. fallback for rpctime and circuit breaker
+//		`client.WithFallback(fallback.TimeoutAndCBFallback(yourErrFBFunc))`
+//
+// NOTICE: WithFallback is only effective for all unary methods.
+// May provide WithUnaryOptions(WithUnaryFallback(d)) option later which is more recommended.
+func WithFallback(fb *fallback.Policy) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if !fallback.IsPolicyValid(fb) {
+			panic(fmt.Errorf("WithFallback: invalid '%+v'", fb))
+		}
+		di.Push(fmt.Sprintf("WithFallback(%+v)", fb))
+		o.UnaryOptions.Fallback = fb
+	}}
+}
+
+// WithCircuitBreaker adds a circuitbreaker suite for the client.
+func WithCircuitBreaker(s *circuitbreak.CBSuite) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push("WithCircuitBreaker()")
+		o.CBSuite = s
+	}}
+}
+
+// WithGRPCConnPoolSize sets the value for the client connection pool size.
+// In general, you should not adjust the size of the connection pool, otherwise it may cause performance degradation.
+// You should adjust the size according to the actual situation.
+func WithGRPCConnPoolSize(s uint32) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCConnPoolSize(%d)", s))
+		o.GRPCConnPoolSize = s
+	}}
+}
+
+// WithGRPCWriteBufferSize determines how much data can be batched before doing a
+// write on the wire. The corresponding memory allocation for this buffer will
+// be twice the size to keep syscalls low. The default value for this buffer is
+// 32KB.
+//
+// Zero will disable the write buffer such that each write will be on underlying
+// connection. Note: A Send call may not directly translate to a write.
+// It corresponds to the WithWriteBufferSize DialOption of gRPC.
+func WithGRPCWriteBufferSize(s uint32) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCWriteBufferSize(%d)", s))
+		o.GRPCConnectOpts.WriteBufferSize = s
+	}}
+}
+
+// WithGRPCReadBufferSize lets you set the size of read buffer, this determines how
+// much data can be read at most for each read syscall.
+//
+// The default value for this buffer is 32KB. Zero will disable read buffer for
+// a connection so data framer can access the underlying conn directly.
+// It corresponds to the WithReadBufferSize DialOption of gRPC.
+func WithGRPCReadBufferSize(s uint32) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCReadBufferSize(%d)", s))
+		o.GRPCConnectOpts.ReadBufferSize = s
+	}}
+}
+
+// WithGRPCInitialWindowSize sets the value for initial window size on a grpc stream.
+// The lower bound for window size is 64K and any value smaller than that will be ignored.
+// It corresponds to the WithInitialWindowSize DialOption of gRPC.
+func WithGRPCInitialWindowSize(s uint32) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCInitialWindowSize(%d)", s))
+		o.GRPCConnectOpts.InitialWindowSize = s
+	}}
+}
+
+// WithGRPCInitialConnWindowSize sets the value for initial window size on a connection of grpc.
+// The lower bound for window size is 64K and any value smaller than that will be ignored.
+// It corresponds to the WithInitialConnWindowSize DialOption of gRPC.
+func WithGRPCInitialConnWindowSize(s uint32) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCInitialConnWindowSize(%d)", s))
+		o.GRPCConnectOpts.InitialConnWindowSize = s
+	}}
+}
+
+// WithGRPCMaxHeaderListSize returns a DialOption that specifies the maximum
+// (uncompressed) size of header list that the client is prepared to accept.
+// It corresponds to the WithMaxHeaderListSize DialOption of gRPC.
+func WithGRPCMaxHeaderListSize(s uint32) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCMaxHeaderListSize(%d)", s))
+		o.GRPCConnectOpts.MaxHeaderListSize = &s
+	}}
+}
+
+// WithGRPCKeepaliveParams returns a DialOption that specifies keepalive parameters for the client transport.
+// It corresponds to the WithKeepaliveParams DialOption of gRPC.
+func WithGRPCKeepaliveParams(kp grpc.ClientKeepalive) Option {
+	if kp.Time < grpc.KeepaliveMinPingTime {
+		kp.Time = grpc.KeepaliveMinPingTime
+	}
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithGRPCKeepaliveParams(%+v)", kp))
+		o.GRPCConnectOpts.KeepaliveParams = kp
+	}}
+}
+
+// WithWarmingUp forces the client to do some warm-ups at the end of the initialization.
+func WithWarmingUp(wuo *warmup.ClientOption) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithWarmingUp(%+v)", wuo))
+		o.WarmUpOption = wuo
+	}}
+}
+
+// WithXDSSuite is used to set the xds suite for the client.
+func WithXDSSuite(suite xds.ClientSuite) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		if xds.CheckClientSuite(suite) {
+			di.Push("WithXDSSuite")
+			o.XDSEnabled = true
+			o.XDSRouterMiddleware = suite.RouterMiddleware
+			o.Resolver = suite.Resolver
+		}
+	}}
+}
+
+// WithContextBackup enables local-session to retrieve context backuped by server,
+// in case of user don't correctly pass context into next RPC call.
+//   - backupHandler pass a handler to check and handler user-defined key-values according to current context, returning backup==false means no need further operations.
+func WithContextBackup(backupHandler func(prev, cur context.Context) (ctx context.Context, backup bool)) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push(fmt.Sprintf("WithContextBackup({%v})", reflect.TypeOf(backupHandler).String()))
+		o.CtxBackupHandler = backupHandler
+	}}
+}
+
+// TailOption is used to covert an option to a tail option
+// which is executed after all options are applied.
+// NOTICE: no compatibility guarantee for this api,
+// just ignore it unless you clearly know what you are doing.
+func TailOption(opt Option) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		o.TailOptions = append(o.TailOptions, opt)
 	}}
 }

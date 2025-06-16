@@ -21,15 +21,34 @@ package transport
 type Protocol int
 
 // Predefined transport protocols.
-// Framed is suggested.
 const (
 	PurePayload Protocol = 0
 
+	// TTHeader unary methods only
 	TTHeader Protocol = 1 << iota
+
+	// Framed unary methods only
 	Framed
+
+	// HTTP unary methods only
 	HTTP
+
+	// GRPC indicates all methods (including unary and streaming) using grpc protocol.
 	GRPC
 
+	// HESSIAN2 unary methods only
+	HESSIAN2
+
+	// TTHeaderStreaming indicates all streaming methods using ttheader streaming protocol,
+	// and it doesn't affect the protocol of all unary methods.
+	TTHeaderStreaming
+
+	// GRPCStreaming indicates all streaming methods using grpc protocol,
+	// and it doesn't affect the protocol of all unary methods.
+	// NOTE: only used in global config of the client side.
+	GRPCStreaming
+
+	// TTHeaderFramed unary methods only
 	TTHeaderFramed = TTHeader | Framed
 )
 
@@ -38,19 +57,30 @@ const Unknown = "Unknown"
 
 // String prints human readable information.
 func (tp Protocol) String() string {
-	switch tp {
-	case PurePayload:
-		return "PurePayload"
-	case TTHeader:
-		return "TTHeader"
-	case Framed:
-		return "Framed"
-	case HTTP:
-		return "HTTP"
-	case TTHeaderFramed:
-		return "TTHeaderFramed"
-	case GRPC:
-		return "GRPC"
+	var s string
+	if tp&TTHeader == TTHeader {
+		s += "TTHeader|"
 	}
-	return Unknown
+	if tp&Framed == Framed {
+		s += "Framed|"
+	}
+	if tp&HTTP == HTTP {
+		s += "HTTP|"
+	}
+	if tp&GRPC == GRPC {
+		s += "GRPC|"
+	}
+	if tp&HESSIAN2 == HESSIAN2 {
+		s += "Hessian2|"
+	}
+	if tp&TTHeaderStreaming == TTHeaderStreaming {
+		s += "TTHeaderStreaming|"
+	}
+	if tp&GRPCStreaming == GRPCStreaming {
+		s += "GRPCStreaming|"
+	}
+	if s != "" {
+		return s[:len(s)-1]
+	}
+	return "PurePayload"
 }

@@ -17,8 +17,11 @@
 package mocks
 
 import (
+	bytes2 "bytes"
 	"net"
 	"time"
+
+	"github.com/cloudwego/gopkg/bufiox"
 )
 
 var _ net.Conn = &Conn{}
@@ -97,4 +100,25 @@ func (m Conn) SetWriteDeadline(t time.Time) (e error) {
 		return m.SetWriteDeadlineFunc(t)
 	}
 	return
+}
+
+func NewIOConn() *Conn {
+	var bytes bytes2.Buffer
+	return &Conn{
+		ReadFunc: func(b []byte) (n int, err error) {
+			return bytes.Read(b)
+		},
+		WriteFunc: func(b []byte) (n int, err error) {
+			return bytes.Write(b)
+		},
+	}
+}
+
+type MockConnWithBufioxReader struct {
+	net.Conn
+	BufioxReader bufiox.Reader
+}
+
+func (c *MockConnWithBufioxReader) Reader() bufiox.Reader {
+	return c.BufioxReader
 }

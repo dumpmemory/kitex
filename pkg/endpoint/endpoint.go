@@ -22,7 +22,7 @@ import "context"
 type Endpoint func(ctx context.Context, req, resp interface{}) (err error)
 
 // Middleware deal with input Endpoint and output Endpoint.
-type Middleware func(Endpoint) Endpoint
+type Middleware func(next Endpoint) Endpoint
 
 // MiddlewareBuilder builds a middleware with information from a context.
 type MiddlewareBuilder func(ctx context.Context) Middleware
@@ -47,6 +47,12 @@ func Build(mws []Middleware) Middleware {
 	}
 }
 
+func (mw Middleware) ToUnaryMiddleware() UnaryMiddleware {
+	return func(next UnaryEndpoint) UnaryEndpoint {
+		return UnaryEndpoint(mw(Endpoint(next)))
+	}
+}
+
 // DummyMiddleware is a dummy middleware.
 func DummyMiddleware(next Endpoint) Endpoint {
 	return next
@@ -63,5 +69,4 @@ type mwCtxKeyType int
 const (
 	CtxEventBusKey mwCtxKeyType = iota
 	CtxEventQueueKey
-	CtxLoggerKey
 )

@@ -18,7 +18,9 @@ package protobuf
 
 import (
 	"context"
-	"fmt"
+	"encoding/binary"
+	"errors"
+	"math/bits"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -31,23 +33,26 @@ import (
 	"github.com/cloudwego/kitex/transport"
 )
 
-var payloadCodec = &protobufCodec{}
-var svcInfo = mocks.ServiceInfo()
+var (
+	payloadCodec = &protobufCodec{}
+	svcInfo      = mocks.ServiceInfo()
+)
 
 func init() {
 	svcInfo.Methods["mock"] = serviceinfo.NewMethodInfo(nil, newMockReqArgs, nil, false)
 }
+
 func TestNormal(t *testing.T) {
 	ctx := context.Background()
 
 	// encode // client side
-	sendMsg := initSendMsg(transport.TTHeader)
+	sendMsg := initMockReqArgsSendMsg()
 	out := remote.NewWriterBuffer(256)
 	err := payloadCodec.Marshal(ctx, sendMsg, out)
 	test.Assert(t, err == nil, err)
 
 	// decode server side
-	var recvMsg = initRecvMsg()
+	recvMsg := initMockReqArgsRecvMsg()
 	buf, err := out.Bytes()
 	recvMsg.SetPayloadLen(len(buf))
 	test.Assert(t, err == nil, err)
@@ -69,6 +74,70 @@ func TestNormal(t *testing.T) {
 	}
 }
 
+type mockFastCodecReq struct {
+	num int32
+	v   string
+}
+
+// sizeVarint returns the encoded size of a varint.
+// The size is guaranteed to be within 1 and 10, inclusive.
+func sizeVarint(v uint64) int {
+	// This computes 1 + (bits.Len64(v)-1)/7.
+	// 9/64 is a good enough approximation of 1/7
+	return int(9*uint32(bits.Len64(v))+64) / 64
+}
+
+func (p *mockFastCodecReq) Size() (n int) {
+	n += sizeVarint(uint64(p.num)<<3 | uint64(2))
+	n += sizeVarint(uint64(len(p.v)))
+	n += len(p.v)
+	return n
+}
+
+func (p *mockFastCodecReq) FastWrite(in []byte) (n int) {
+	n += binary.PutUvarint(in, uint64(p.num)<<3|uint64(2)) // Tag
+	n += binary.PutUvarint(in[n:], uint64(len(p.v)))       // varint len of string
+	n += copy(in[n:], p.v)
+	return
+}
+
+func (p *mockFastCodecReq) FastRead(buf []byte, t int8, number int32) (int, error) {
+	if t != 2 {
+		panic(t)
+	}
+	p.num = number
+	sz, n := binary.Uvarint(buf)
+	buf = buf[n:]
+	p.v = string(buf[:sz])
+	return int(sz) + n, nil
+}
+
+func (p *mockFastCodecReq) Marshal(_ []byte) ([]byte, error) { panic("not in use") }
+func (p *mockFastCodecReq) Unmarshal(_ []byte) error         { panic("not in use") }
+
+func TestFastCodec(t *testing.T) {
+	ctx := context.Background()
+
+	req0 := &mockFastCodecReq{num: 7, v: "hello"}
+	send := initSendMsg(transport.TTHeader, req0)
+
+	buf := remote.NewReaderWriterBuffer(256)
+	p := protobufCodec{}
+	err := p.Marshal(ctx, send, buf)
+	test.Assert(t, err == nil, err)
+
+	b, err := buf.Bytes()
+	test.Assert(t, err == nil, err)
+
+	req1 := &mockFastCodecReq{}
+	recv := initRecvMsg(req1)
+	recv.SetPayloadLen(len(b))
+	err = payloadCodec.Unmarshal(ctx, recv, buf)
+	test.Assert(t, err == nil, err)
+	test.Assert(t, req0.num == req1.num, req1.num)
+	test.Assert(t, req0.v == req1.v, req1.v)
+}
+
 func TestException(t *testing.T) {
 	ctx := context.Background()
 	ink := rpcinfo.NewInvocation("", "mock")
@@ -82,18 +151,32 @@ func TestException(t *testing.T) {
 	test.Assert(t, err == nil, err)
 
 	// decode client side
-	var recvMsg = initClientRecvMsg(ri)
+	recvMsg := initClientRecvMsg(ri)
 	buf, err := out.Bytes()
 	recvMsg.SetPayloadLen(len(buf))
 	test.Assert(t, err == nil, err)
 	in := remote.NewReaderBuffer(buf)
 	err = payloadCodec.Unmarshal(ctx, recvMsg, in)
 	test.Assert(t, err != nil)
-	pbErr, ok := err.(*pbError)
+	transErr, ok := err.(*remote.TransError)
 	test.Assert(t, ok)
 	test.Assert(t, err.Error() == errInfo)
-	test.Assert(t, pbErr.errProto.Message == errInfo)
-	test.Assert(t, pbErr.errProto.TypeID == remote.UnknownMethod)
+	test.Assert(t, transErr.Error() == errInfo)
+	test.Assert(t, transErr.TypeID() == remote.UnknownMethod)
+}
+
+func TestTransErrorUnwrap(t *testing.T) {
+	errMsg := "mock err"
+	transErr := remote.NewTransError(remote.InternalError, NewPbError(1000, errMsg))
+	uwErr, ok := transErr.Unwrap().(PBError)
+	test.Assert(t, ok)
+	test.Assert(t, uwErr.TypeID() == 1000)
+	test.Assert(t, transErr.Error() == errMsg)
+
+	uwErr2, ok := errors.Unwrap(transErr).(PBError)
+	test.Assert(t, ok)
+	test.Assert(t, uwErr2.TypeID() == 1000)
+	test.Assert(t, uwErr2.Error() == errMsg)
 }
 
 func BenchmarkNormalParallel(b *testing.B) {
@@ -103,13 +186,13 @@ func BenchmarkNormalParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			// encode // client side
-			sendMsg := initSendMsg(transport.TTHeader)
+			sendMsg := initMockReqArgsSendMsg()
 			out := remote.NewWriterBuffer(256)
 			err := payloadCodec.Marshal(ctx, sendMsg, out)
 			test.Assert(b, err == nil, err)
 
 			// decode server side
-			var recvMsg = initRecvMsg()
+			recvMsg := initMockReqArgsRecvMsg()
 			buf, err := out.Bytes()
 			recvMsg.SetPayloadLen(len(buf))
 			test.Assert(b, err == nil, err)
@@ -133,25 +216,33 @@ func BenchmarkNormalParallel(b *testing.B) {
 	})
 }
 
-func initSendMsg(tp transport.Protocol) remote.Message {
-	var _args MockReqArgs
-	_args.Req = prepareReq()
+func initMockReqArgsSendMsg() remote.Message {
+	m := &MockReqArgs{}
+	m.Req = prepareReq()
+	return initSendMsg(transport.TTHeader, m)
+}
+
+func initSendMsg(tp transport.Protocol, m any) remote.Message {
 	ink := rpcinfo.NewInvocation("", "mock")
 	ri := rpcinfo.NewRPCInfo(nil, nil, ink, nil, nil)
-	var msg = remote.NewMessage(&_args, svcInfo, ri, remote.Call, remote.Client)
+	msg := remote.NewMessage(m, svcInfo, ri, remote.Call, remote.Client)
 	msg.SetProtocolInfo(remote.NewProtocolInfo(tp, svcInfo.PayloadCodec))
 	return msg
 }
 
-func initRecvMsg() remote.Message {
-	var _args MockReqArgs
+func initMockReqArgsRecvMsg() remote.Message {
+	m := &MockReqArgs{}
+	return initRecvMsg(m)
+}
+
+func initRecvMsg(m any) remote.Message {
 	ink := rpcinfo.NewInvocation("", "mock")
 	ri := rpcinfo.NewRPCInfo(nil, nil, ink, nil, nil)
-	msg := remote.NewMessage(&_args, svcInfo, ri, remote.Call, remote.Server)
+	msg := remote.NewMessage(m, svcInfo, ri, remote.Call, remote.Server)
 	return msg
 }
 
-func initServerErrorMsg(tp transport.Protocol, ri rpcinfo.RPCInfo, transErr remote.TransError) remote.Message {
+func initServerErrorMsg(tp transport.Protocol, ri rpcinfo.RPCInfo, transErr *remote.TransError) remote.Message {
 	errMsg := remote.NewMessage(transErr, svcInfo, ri, remote.Exception, remote.Server)
 	errMsg.SetProtocolInfo(remote.NewProtocolInfo(tp, svcInfo.PayloadCodec))
 	return errMsg
@@ -164,7 +255,7 @@ func initClientRecvMsg(ri rpcinfo.RPCInfo) remote.Message {
 }
 
 func prepareReq() *MockReq {
-	var strMap = make(map[string]string)
+	strMap := make(map[string]string)
 	strMap["key1"] = "val1"
 	strMap["key2"] = "val2"
 	strList := []string{"str1", "str2"}
@@ -186,7 +277,7 @@ type MockReqArgs struct {
 
 func (p *MockReqArgs) Marshal(out []byte) ([]byte, error) {
 	if !p.IsSetReq() {
-		return out, fmt.Errorf("No req in MockReqArgs")
+		return out, nil
 	}
 	return proto.Marshal(p.Req)
 }
